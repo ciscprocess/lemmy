@@ -1,0 +1,80 @@
+FROM ubuntu:18.04 as builder
+WORKDIR /app
+
+ARG CARGO_BUILD_TARGET=aarch64-unknown-linux-musl
+ARG RUST_RELEASE_MODE="debug"
+ARG TOOLCHAIN=stable
+ARG OPENSSL_VERSION=1.1.1m
+ARG POSTGRESQL_VERSION=11.14
+ARG ZLIB_VERSION=1.2.13
+
+USER root
+RUN apt update && \
+    export DEBIAN_FRONTEND=noninteractive && \
+    apt install -yq build-essential curl git musl-dev musl-tools \
+        libpq-dev libssl-dev linux-libc-dev pkgconf && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ENV PREFIX=/usr/local/musl
+ENV CC=musl-gcc \
+    PATH=/usr/local/bin:/root/.cargo/bin:$PATH \
+    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
+    LD_LIBRARY_PATH=$PREFIX
+
+RUN mkdir $PREFIX && \
+    echo "$PREFIX/lib" >> /etc/ld-musl-aarch64.path && \
+    # This looks like a hack, and it kind of is. Lemmy is compiled using the musl rust targets,
+    # and musl's default include directories do not contain the linux headers, as musl doesn't
+    # support compiling mixed kernel and userspace code: https://wiki.musl-libc.org/faq.html#Q:-Why-am-I-getting-
+    # Normally this wouldn't matter so much, but OpenSSL uses linux kernel headers, and OpenSSL is needed for lemmy.
+    # Since we don't want to bring in glibc dependencies, we manually symlink the needed headers here.
+    ln -s /usr/include/aarch64-linux-gnu/asm /usr/include/aarch64-linux-musl/asm && \
+    ln -s /usr/include/asm-generic /usr/include/aarch64-linux-musl/asm-generic && \
+    ln -s /usr/include/linux /usr/include/aarch64-linux-musl/linux
+
+# Must build OpenSSL manually since the default installation on Debian/Ubuntu has issues with the
+# openssl-sys crate.
+RUN cd /tmp && \
+    curl -sSL https://www.openssl.org/source/openssl-$OPENSSL_VERSION.tar.gz | tar xz && \
+    cd openssl-$OPENSSL_VERSION && \
+    ./Configure no-zlib no-shared -fPIC --prefix=$PREFIX linux-aarch64 && \
+    env C_INCLUDE_PATH=$PREFIX/include: make depend && \
+    make -j$(nproc) && make install
+
+# Build zlib as needed to build postgres
+RUN curl -sSL https://zlib.net/zlib-$ZLIB_VERSION.tar.gz | tar xz && \
+    cd zlib-$ZLIB_VERSION && \
+    LDFLAGS="-L$PREFIX/lib" CFLAGS="-I$PREFIX/include" ./configure --static --prefix=$PREFIX && \
+    make -j$(nproc) && make install && \
+    cd .. && rm -rf zlib-$ZLIB_VERSION
+
+# Needed by rust postgres client
+RUN cd /tmp && \
+    curl -sSL https://ftp.postgresql.org/pub/source/v$POSTGRESQL_VERSION/postgresql-$POSTGRESQL_VERSION.tar.gz | tar xz && \
+    cd "postgresql-$POSTGRESQL_VERSION" && \
+    CPPFLAGS=-I/usr/local/musl/include LDFLAGS=-L/usr/local/musl/lib ./configure --with-openssl --without-readline --prefix=/usr/local/musl && \
+    cd src/interfaces/libpq && make all-static-lib && make install-lib-static && \
+    cd ../../bin/pg_config && make && make install && \
+    rm -r /tmp/*
+
+ENV RUSTUP_HOME=/opt/rust/rustup \
+    PATH=/home/rust/.cargo/bin:/opt/rust/cargo/bin:/usr/local/musl/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RUN curl https://sh.rustup.rs -sSf | \
+    env CARGO_HOME=/opt/rust/cargo \
+        sh -s -- -y --default-toolchain $TOOLCHAIN --profile minimal --no-modify-path && \
+    env CARGO_HOME=/opt/rust/cargo \
+        rustup component add rustfmt && \
+    env CARGO_HOME=/opt/rust/cargo \
+        rustup component add clippy && \
+    env CARGO_HOME=/opt/rust/cargo \
+        rustup target add aarch64-unknown-linux-musl
+
+RUN ln -s /usr/bin/musl-gcc /usr/bin/aarch64-linux-musl-gcc
+ENV OPENSSL_DIR=$PREFIX \
+    OPENSSL_STATIC=1 \
+    PQ_LIB_STATIC=1 \
+    PG_CONFIG_AARCH64=/usr/bin/pg_config \
+    PKG_CONFIG_ALLOW_CROSS=true \
+    PKG_CONFIG_ALL_STATIC=true \
+    LIBZ_SYS_STATIC=1 \
+    TARGET=musl

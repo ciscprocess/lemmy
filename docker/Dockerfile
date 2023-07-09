@@ -1,4 +1,5 @@
-FROM clux/muslrust:1.70.0 as builder
+ARG BASE_IMAGE=clux/muslrust:1.70.0
+FROM ${BASE_IMAGE} as builder
 WORKDIR /app
 ARG CARGO_BUILD_TARGET=x86_64-unknown-linux-musl
 
